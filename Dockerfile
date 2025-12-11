@@ -1,51 +1,50 @@
-FROM eclipse-temurin:21-jre-jammy
+# 例: ghcr.io/alexandergg-0520/fabric-c2me-gpu-server:latest
+FROM bitnami/minideb:bookworm
 
-# --- Basic dependencies ---
-RUN apt-get update && apt-get install -y \
-    curl unzip jq ca-certificates gnupg \
-    && rm -rf /var/lib/apt/lists/*
+# 環境
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
 
-# --- OpenCL ICD loader + vendor filesを使うための準備 ---
-RUN apt-get update && apt-get install -y \
-    ocl-icd-libopencl1 \
-    && rm -rf /var/lib/apt/lists/*
+# 必要パッケージ
+# - openjdk-21-jre-headless : Minecraftサーバー用
+# - curl, wget, ca-certificates : ダウンロード系
+# - tzdata : タイムゾーン
+# - mc : MinIO client（名前被り防止のため /usr/local/bin/mc にリンク）
+# - ocl-icd-libopencl1 : 汎用 OpenCL ローダ（GPUベンダーのICDはホストからmountする想定）
+RUN install_packages \
+      openjdk-21-jre-headless \
+      curl wget ca-certificates \
+      tzdata \
+      jq \
+      libssl3 \
+      ocl-icd-libopencl1 \
+      bash \
+      tini \
+      procps && \
+    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && \
+    chmod +x /usr/local/bin/mc && \
+    mkdir -p /opt/minecraft /data /mods /config && \
+    useradd -r -u 1000 -g users mcserver && \
+    chown -R mcserver:users /opt/minecraft /data /mods /config
 
-# NVIDIA コンテナランタイムを使う前提
-ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}"
+# 作業ディレクトリ
+WORKDIR /opt/minecraft
 
-# --- Directories ---
-RUN mkdir -p /data /mods /config /opt/mc
-WORKDIR /opt/mc
+# エントリポイントスクリプトをコピー
+COPY entrypoint.sh /opt/minecraft/entrypoint.sh
+RUN chmod +x /opt/minecraft/entrypoint.sh && \
+    chown mcserver:users /opt/minecraft/entrypoint.sh
 
-# --- Entry script ---
-COPY entrypoint.sh /opt/mc/entrypoint.sh
-RUN chmod +x /opt/mc/entrypoint.sh
+# （任意）server.jar や、mc-image-helper 相当のツールをここに追加してもOK
+# COPY server.jar /opt/minecraft/server.jar
 
-# --- Default ENV (itzg互換＋拡張) ---
-ENV TYPE="VANILLA" \
-    VERSION="LATEST" \
-    MEMORY="4G" \
-    INIT_MEMORY="1G" \
-    MAX_MEMORY="4G" \
-    USE_AIKAR_FLAGS="false" \
-    USE_MEOWICE_FLAGS="false" \
-    USE_MEOWICE_GRAALVM_FLAGS="false" \
-    JVM_OPTS="" \
-    JVM_DD_OPTS="" \
-    JVM_XX_OPTS="" \
-    EXTRA_ARGS="" \
-    MOTD="A Minecraft Server Running with GPU OpenCL" \
-    DIFFICULTY="normal" \
-    MAX_PLAYERS="20" \
-    ENABLE_WHITELIST="false" \
-    WHITELIST="" \
-    ENABLE_RCON="false" \
-    RCON_PASSWORD="" \
-    RCON_PORT="25575"
-
-# Expose ports
-EXPOSE 25565 25575
-
+# データ用ボリューム
 VOLUME ["/data"]
 
-ENTRYPOINT ["/opt/mc/entrypoint.sh"]
+# デフォルトポート
+EXPOSE 25565
+
+USER mcserver
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/minecraft/entrypoint.sh"]

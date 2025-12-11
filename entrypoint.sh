@@ -1,121 +1,350 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "[entry] Starting custom GPU Minecraft server..."
+log()  { echo "[$(date -Iseconds)] [INFO ] $*"; }
+warn() { echo "[$(date -Iseconds)] [WARN ] $*" >&2; }
+err()  { echo "[$(date -Iseconds)] [ERROR] $*" >&2; }
 
-#############################################
-# 1. Basic Directories
-#############################################
-mkdir -p /data/mods /data/config
-chmod -R 1000:1000 /data
+# ==============================
+# 1. デフォルト値の定義
+# ==============================
 
-#############################################
-# 2. Type / Version handling
-#############################################
-MC_TYPE="${TYPE:-VANILLA}"
-MC_VERSION="${VERSION:-LATEST}"
+# タイムゾーン
+: "${TZ:=Asia/Tokyo}"
 
-echo "[entry] Server type = $MC_TYPE"
-echo "[entry] Server version = $MC_VERSION"
+# 基本モード
+: "${TYPE:=FABRIC}"                  # 将来的に VANILLA/PAPER なども可
+: "${MC_VERSION:=1.21.10}"
+: "${FABRIC_LOADER_VERSION:=0.18.2}"
+: "${FABRIC_LAUNCHER_VERSION:=1.1.0}"
 
-#############################################
-# 3. Download server jars depending on TYPE
-#############################################
-download_fabric() {
-    echo "[entry] Downloading Fabric installer..."
+# メモリ/JVM
+: "${INIT_MEMORY:=1G}"
+: "${MAX_MEMORY:=6G}"
+: "${USE_AIKAR_FLAGS:=true}"
+: "${JVM_EXTRA:=}"
+: "${JAVA_VERSION:=21}"              # イメージ内のJavaと合わせる用のメタ情報
 
-    curl -sSL -o fabric-installer.jar \
-        "https://meta.fabricmc.net/v2/versions/installer/0.11.2/installer.jar"
+# server.properties 関連
+: "${OVERRIDE_SERVER_PROPERTIES:=false}"
+: "${LEVEL_NAME:=world}"
+: "${MOTD:=Aivis GPU Accelerated Server}"
+: "${DIFFICULTY:=hard}"
+: "${MAX_PLAYERS:=20}"
+: "${ONLINE_MODE:=true}"
+: "${ALLOW_FLIGHT:=false}"
+: "${VIEW_DISTANCE:=10}"
+: "${SIMULATION_DISTANCE:=10}"
+: "${ENABLE_COMMAND_BLOCK:=true}"
+: "${PVP:=true}"
+: "${ENABLE_STATUS:=true}"
+: "${WHITE_LIST:=false}"
+: "${SEED:=}"
 
-    echo "[entry] Installing Fabric server..."
-    java -jar fabric-installer.jar server -downloadMinecraft \
-        -mcversion "$MC_VERSION" -loader 0.18.2 -noprofile
+# MinIO mods/config sync
+: "${ENABLE_MINIO_SYNC:=false}"
+: "${MINIO_URL:=}"
+: "${MINIO_ACCESS_KEY:=}"
+: "${MINIO_SECRET_KEY:=}"
+: "${MINIO_BUCKET_MODS:=}"
+: "${MINIO_BUCKET_CONFIG:=}"
+: "${MINIO_SYNC_ON_STARTUP:=true}"
 
-    SERVER_JAR="fabric-server-launch.jar"
-}
+# GPU/OpenCL/C2ME
+: "${ENABLE_GPU:=false}"
+: "${OPENCL_LIB_PATH:=}"                    # 例: /usr/local/lib/libOpenCL.so.1
+: "${OPENCL_PLATFORM:=auto}"
+: "${OPENCL_DEVICE_INDEX:=0}"
+: "${C2ME_GPU_ENABLE:=true}"
+: "${C2ME_GPU_MAX_WORKERS:=auto}"
 
-download_vanilla() {
-    echo "[entry] Downloading Vanilla server..."
-    META_URL="https://launchermeta.mojang.com/mc/game/version_manifest.json"
+# ワールド管理
+: "${ENABLE_WORLD_RESET:=false}"
+: "${WORLD_RESET_FLAG:=/data/reset-world.flag}"
+: "${WORLD_RESET_ON_STARTUP:=false}"
 
-    DL_URL=$(curl -sSL "$META_URL" | jq -r \
-        ".versions[] | select(.id==\"$MC_VERSION\") | .url")
+# バックアップ
+: "${ENABLE_BACKUP:=false}"
+: "${BACKUP_INTERVAL:=6h}"
+: "${BACKUP_KEEP:=5}"
+: "${BACKUP_METHOD:=local}"                 # local|minio
+: "${BACKUP_DIR:=/data/backups}"
+: "${BACKUP_MINIO_PATH:=}"
 
-    SERVER_JAR_URL=$(curl -sSL "$DL_URL" | jq -r '.downloads.server.url')
+# 自動停止/再起動（将来用）
+: "${STOP_SERVER_ON_EMPTY:=false}"
+: "${EMPTY_STOP_DELAY:=1800}"
 
-    curl -sSL -o server.jar "$SERVER_JAR_URL"
-    SERVER_JAR="server.jar"
-}
+# ログ/デバッグ
+: "${LOG_TIMESTAMP:=true}"
+: "${DEBUG_OPENCL:=false}"
+: "${DEBUG_JVM:=false}"
+: "${DEBUG_C2ME:=false}"
 
-case "$MC_TYPE" in
-    FABRIC)
-        download_fabric
-        ;;
-    VANILLA)
-        download_vanilla
-        ;;
-    *)
-        echo "[entry] Unknown TYPE=$MC_TYPE"
-        exit 1
-        ;;
-esac
+# ディレクトリを確認
+DATA_DIR=/data
+cd /opt/minecraft
 
-#############################################
-# 4. JVM flags handling (itzg互換)
-#############################################
-JAVA_FLAGS=""
-
-# memory
-JAVA_FLAGS="$JAVA_FLAGS -Xms${INIT_MEMORY} -Xmx${MAX_MEMORY}"
-
-# Aikar flags
-if [[ "$USE_AIKAR_FLAGS" == "true" ]]; then
-    JAVA_FLAGS="$JAVA_FLAGS -XX:+UseG1GC -XX:+ParallelRefProcEnabled \
-      -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions"
+# ==============================
+# 2. タイムゾーン
+# ==============================
+if [ -n "${TZ}" ] && [ -e "/usr/share/zoneinfo/${TZ}" ]; then
+  log "Setting timezone to ${TZ}"
+  sudo ln -sf "/usr/share/zoneinfo/${TZ}" /etc/localtime || true
+  echo "${TZ}" | sudo tee /etc/timezone >/dev/null || true
+else
+  warn "TZ='${TZ}' is invalid or not found, using image default"
 fi
 
-# meowice flags
-if [[ "$USE_MEOWICE_FLAGS" == "true" ]]; then
-    JAVA_FLAGS="$JAVA_FLAGS -XX:+UseZGC -XX:+ZUncommit -XX:MaxGCPauseMillis=40"
+# ==============================
+# 3. MinIO から mods/config 同期
+# ==============================
+sync_minio() {
+  if [ "${ENABLE_MINIO_SYNC}" != "true" ]; then
+    log "MinIO sync disabled (ENABLE_MINIO_SYNC != true)"
+    return 0
+  fi
+
+  if [ -z "${MINIO_URL}" ] || [ -z "${MINIO_ACCESS_KEY}" ] || [ -z "${MINIO_SECRET_KEY}" ]; then
+    warn "MinIO sync enabled but MINIO_URL or credentials are missing, skipping."
+    return 0
+  fi
+
+  log "Configuring MinIO client..."
+  mc alias set minio "${MINIO_URL}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}"
+
+  if [ -n "${MINIO_BUCKET_MODS}" ]; then
+    log "Syncing mods from MinIO bucket ${MINIO_BUCKET_MODS}"
+    mc mirror --overwrite --remove "minio/${MINIO_BUCKET_MODS}" /mods || warn "Failed to sync mods from MinIO"
+  fi
+
+  if [ -n "${MINIO_BUCKET_CONFIG}" ]; then
+    log "Syncing config from MinIO bucket ${MINIO_BUCKET_CONFIG}"
+    mc mirror --overwrite --remove "minio/${MINIO_BUCKET_CONFIG}" /config || warn "Failed to sync config from MinIO"
+  fi
+
+  # /data にコピー
+  log "Copying /mods -> /data/mods and /config -> /data/config"
+  mkdir -p "${DATA_DIR}/mods" "${DATA_DIR}/config"
+  cp -a /mods/. "${DATA_DIR}/mods/" 2>/dev/null || true
+  cp -a /config/. "${DATA_DIR}/config/" 2>/dev/null || true
+
+  chown -R mcserver:users "${DATA_DIR}/mods" "${DATA_DIR}/config" || true
+}
+
+if [ "${MINIO_SYNC_ON_STARTUP}" = "true" ]; then
+  sync_minio
+else
+  log "MinIO sync on startup disabled (MINIO_SYNC_ON_STARTUP != true)"
 fi
 
-# extra JVM opts
-JAVA_FLAGS="$JAVA_FLAGS $JVM_OPTS $JVM_DD_OPTS $JVM_XX_OPTS"
+# ==============================
+# 4. ワールドリセット
+# ==============================
+reset_world_if_needed() {
+  if [ "${ENABLE_WORLD_RESET}" != "true" ]; then
+    return 0
+  fi
 
-#############################################
-# 5. server.properties generation
-#############################################
-echo "[entry] Writing server.properties..."
+  if [ "${WORLD_RESET_ON_STARTUP}" = "true" ] || [ -f "${WORLD_RESET_FLAG}" ]; then
+    warn "World reset requested. Deleting world directories under ${DATA_DIR}..."
+    rm -rf "${DATA_DIR}/${LEVEL_NAME}" \
+           "${DATA_DIR}/${LEVEL_NAME}_nether" \
+           "${DATA_DIR}/${LEVEL_NAME}_the_end" || true
+    rm -f "${WORLD_RESET_FLAG}" || true
+  fi
+}
 
-cat >/data/server.properties <<EOF
+reset_world_if_needed
+
+# ==============================
+# 5. server.properties 生成
+# ==============================
+generate_server_properties() {
+  local file="${DATA_DIR}/server.properties"
+
+  if [ -f "${file}" ] && [ "${OVERRIDE_SERVER_PROPERTIES}" != "true" ]; then
+    log "server.properties already exists and OVERRIDE_SERVER_PROPERTIES != true, skipping regeneration."
+    return 0
+  fi
+
+  log "Generating server.properties at ${file}"
+
+  cat > "${file}" <<EOF
+# Generated by custom GPU-enabled Fabric image
 motd=${MOTD}
+level-name=${LEVEL_NAME}
 difficulty=${DIFFICULTY}
 max-players=${MAX_PLAYERS}
-enable-rcon=${ENABLE_RCON}
-rcon.password=${RCON_PASSWORD}
-rcon.port=${RCON_PORT}
-enable-whitelist=${ENABLE_WHITELIST}
+online-mode=${ONLINE_MODE}
+allow-flight=${ALLOW_FLIGHT}
+view-distance=${VIEW_DISTANCE}
+simulation-distance=${SIMULATION_DISTANCE}
+enable-command-block=${ENABLE_COMMAND_BLOCK}
+pvp=${PVP}
+enable-status=${ENABLE_STATUS}
+white-list=${WHITE_LIST}
 EOF
 
-#############################################
-# 6. Whitelist
-#############################################
-if [[ "$ENABLE_WHITELIST" == "true" && "$WHITELIST" != "" ]]; then
-    echo "[entry] Applying whitelist..."
-    echo "$WHITELIST" | tr ',' '\n' | jq -R '{"name": .}' > /data/whitelist.json
+  if [ -n "${SEED}" ]; then
+    echo "level-seed=${SEED}" >> "${file}"
+  fi
+
+  chown mcserver:users "${file}" || true
+}
+
+generate_server_properties
+
+# ==============================
+# 6. GPU / OpenCL 設定
+# ==============================
+setup_opencl() {
+  if [ "${ENABLE_GPU}" != "true" ]; then
+    log "GPU / OpenCL disabled (ENABLE_GPU != true)"
+    return 0
+  fi
+
+  log "GPU / OpenCL enabled. Checking libOpenCL.so..."
+
+  if [ -n "${OPENCL_LIB_PATH}" ] && [ -f "${OPENCL_LIB_PATH}" ]; then
+    local dir
+    dir=$(dirname "${OPENCL_LIB_PATH}")
+    export LD_LIBRARY_PATH="${dir}:${LD_LIBRARY_PATH:-}"
+    log "Using OPENCL_LIB_PATH=${OPENCL_LIB_PATH}, LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+  else
+    # 汎用パスをスキャン
+    for p in /usr/lib64/libOpenCL.so.1 /usr/lib/x86_64-linux-gnu/libOpenCL.so.1 /usr/lib/libOpenCL.so.1; do
+      if [ -f "${p}" ]; then
+        local dir
+        dir=$(dirname "${p}")
+        export LD_LIBRARY_PATH="${dir}:${LD_LIBRARY_PATH:-}"
+        log "Detected OpenCL at ${p}, LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+        return 0
+      fi
+    done
+
+    warn "libOpenCL.so.1 not found in standard locations. Make sure host GPU drivers are mounted."
+  fi
+}
+
+setup_opencl
+
+# ==============================
+# 7. バックアップ
+# ==============================
+start_backup_loop() {
+  if [ "${ENABLE_BACKUP}" != "true" ]; then
+    return 0
+  fi
+
+  mkdir -p "${BACKUP_DIR}"
+  log "Starting backup loop: interval=${BACKUP_INTERVAL}, keep=${BACKUP_KEEP}, method=${BACKUP_METHOD}"
+
+  (
+    while true; do
+      sleep "${BACKUP_INTERVAL}"
+
+      ts="$(date +%Y%m%d-%H%M%S)"
+      archive="${BACKUP_DIR}/world-${ts}.tar.gz"
+
+      log "[backup] Creating archive ${archive}"
+      tar -czf "${archive}" -C "${DATA_DIR}" "${LEVEL_NAME}" "${LEVEL_NAME}_nether" "${LEVEL_NAME}_the_end" 2>/dev/null || \
+        warn "[backup] Failed to create archive"
+
+      # 古いバックアップ削除
+      ls -1t "${BACKUP_DIR}/world-"*.tar.gz 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) | xargs -r rm -f || true
+
+      # MinIO に送る場合
+      if [ "${BACKUP_METHOD}" = "minio" ] && [ -n "${BACKUP_MINIO_PATH}" ]; then
+        if [ -z "${MINIO_URL}" ] || [ -z "${MINIO_ACCESS_KEY}" ] || [ -z "${MINIO_SECRET_KEY}" ]; then
+          warn "[backup] BACKUP_METHOD=minio だが MinIO の設定が不十分です"
+        else
+          log "[backup] Uploading ${archive} to MinIO path ${BACKUP_MINIO_PATH}"
+          mc alias set minio "${MINIO_URL}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" || true
+          mc cp "${archive}" "minio/${BACKUP_MINIO_PATH}/" || warn "[backup] Failed to upload backup to MinIO"
+        fi
+      fi
+    done
+  ) &
+}
+
+start_backup_loop
+
+# ==============================
+# 8. JVM 引数構築
+# ==============================
+build_jvm_args() {
+  local jvm=()
+
+  jvm+=("-Xms${INIT_MEMORY}")
+  jvm+=("-Xmx${MAX_MEMORY}")
+
+  if [ "${USE_AIKAR_FLAGS}" = "true" ]; then
+    # ざっくり Aikar 系（必要なら調整してOK）
+    jvm+=(
+      "-XX:+UseG1GC"
+      "-XX:+ParallelRefProcEnabled"
+      "-XX:MaxGCPauseMillis=200"
+      "-XX:+UnlockExperimentalVMOptions"
+      "-XX:+DisableExplicitGC"
+      "-XX:+AlwaysPreTouch"
+      "-XX:G1NewSizePercent=30"
+      "-XX:G1MaxNewSizePercent=40"
+      "-XX:G1HeapRegionSize=8M"
+      "-XX:G1ReservePercent=20"
+      "-XX:G1HeapWastePercent=5"
+      "-XX:G1MixedGCCountTarget=4"
+      "-XX:InitiatingHeapOccupancyPercent=15"
+      "-XX:G1MixedGCLiveThresholdPercent=90"
+      "-XX:G1RSetUpdatingPauseTimePercent=5"
+      "-XX:SurvivorRatio=32"
+      "-XX:+PerfDisableSharedMem"
+      "-XX:MaxTenuringThreshold=1"
+    )
+  fi
+
+  if [ -n "${JVM_EXTRA}" ]; then
+    # シェルワード分割を許す
+    # shellcheck disable=SC2206
+    extra_args=(${JVM_EXTRA})
+    jvm+=("${extra_args[@]}")
+  fi
+
+  echo "${jvm[@]}"
+}
+
+JVM_ARGS="$(build_jvm_args)"
+[ "${DEBUG_JVM}" = "true" ] && log "JVM_ARGS: ${JVM_ARGS}"
+
+# ==============================
+# 9. server.jar の存在チェック
+# ==============================
+if [ ! -f "${DATA_DIR}/server.jar" ] && [ -f "/opt/minecraft/server.jar" ]; then
+  log "No server.jar in /data, using built-in /opt/minecraft/server.jar"
+  cp /opt/minecraft/server.jar "${DATA_DIR}/server.jar"
+  chown mcserver:users "${DATA_DIR}/server.jar"
 fi
 
-#############################################
-# 7. GPU (OpenCL) runtime fixes
-#############################################
-echo "[entry] GPU(OpenCL) path: $LD_LIBRARY_PATH"
-echo "[entry] Checking OpenCL ICD..."
-ls -l /etc/OpenCL/vendors || true
+if [ ! -f "${DATA_DIR}/server.jar" ]; then
+  err "server.jar not found in ${DATA_DIR}. Please mount or bake server.jar into the image."
+  exit 1
+fi
 
-#############################################
-# 8. Run server
-#############################################
-echo "[entry] Running server with:"
-echo "java $JAVA_FLAGS -jar $SERVER_JAR $EXTRA_ARGS"
+cd "${DATA_DIR}"
 
-exec java $JAVA_FLAGS -jar "$SERVER_JAR" $EXTRA_ARGS
+# ==============================
+# 10. 起動ログ + C2ME 向け環境
+# ==============================
+if [ "${C2ME_GPU_ENABLE}" = "true" ]; then
+  export C2ME_OPENCL_ENABLED=true
+  [ "${C2ME_GPU_MAX_WORKERS}" != "auto" ] && export C2ME_OPENCL_MAX_WORKERS="${C2ME_GPU_MAX_WORKERS}"
+  [ "${DEBUG_C2ME}" = "true" ] && log "C2ME OpenCL enabled with workers=${C2ME_GPU_MAX_WORKERS}"
+fi
+
+log "Starting Minecraft server: TYPE=${TYPE}, MC_VERSION=${MC_VERSION}, LEVEL_NAME=${LEVEL_NAME}"
+
+# ==============================
+# 11. サーバー起動
+# ==============================
+
+exec java ${JVM_ARGS} -jar server.jar nogui
