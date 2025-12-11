@@ -1,0 +1,218 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mc-server
+
+---
+# ================================================
+# PVC for persistent world data
+# ================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mc-fabric-gpu-data
+  namespace: mc-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 40Gi
+
+---
+# ================================================
+# ConfigMap: ENV values for server.properties
+# ================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mc-fabric-gpu-config
+  namespace: mc-server
+data:
+  TYPE: "FABRIC"
+  VERSION: "1.21.10"
+  INIT_MEMORY: "1G"
+  MAX_MEMORY: "6G"
+  USE_AIKAR_FLAGS: "true"
+  MOTD: "Fabric + C2ME GPU Server"
+  DIFFICULTY: "normal"
+  MAX_PLAYERS: "20"
+
+---
+# ================================================
+# Secret: MinIO Access Keys
+# ================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: mc-server
+type: Opaque
+stringData:
+  MINIO_ENDPOINT: "https://minio.example.com"
+  MINIO_ACCESS_KEY: "YOUR_KEY"
+  MINIO_SECRET_KEY: "YOUR_SECRET"
+
+---
+# ================================================
+# Deployment
+# ================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fabric-gpu-c2me-minio
+  namespace: mc-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: fabric-gpu-c2me-minio
+  template:
+    metadata:
+      labels:
+        app: fabric-gpu-c2me-minio
+    spec:
+      runtimeClassName: nvidia   # GPU runtime
+
+      initContainers:
+        # ----------------------------------------------------
+        # MinIO Sync: mods + config
+        # ----------------------------------------------------
+        - name: sync-mods-config
+          image: minio/mc:latest
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              echo "=== MinIO Sync ==="
+              mc alias set minio "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}"
+
+              echo "Syncing mods..."
+              mc mirror --overwrite --remove minio/minecraft/mods/ /mods/
+
+              echo "Syncing config..."
+              mc mirror --overwrite --remove minio/minecraft/config/ /config/
+
+              echo "Fixing permissions..."
+              chown -R 1000:1000 /mods /config
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          volumeMounts:
+            - name: mods
+              mountPath: /mods
+            - name: config
+              mountPath: /config
+
+        # ----------------------------------------------------
+        # OpenCL ICD 配置（GPU OPENCL 有効化用）
+        # ----------------------------------------------------
+        - name: copy-opencl-libs
+          image: debian:stable-slim
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              echo "Copying host OpenCL libs..."
+              mkdir -p /opt/opencl
+              cp /host/libnvidia-opencl.so.1 /opt/opencl/ || true
+              cp /host/libOpenCL.so.1 /opt/opencl/ || true
+              cp /host/libcuda.so.1 /opt/opencl/ || true
+          volumeMounts:
+            - name: host-opencl
+              mountPath: /host
+              readOnly: true
+            - name: opencl-libs
+              mountPath: /opt/opencl
+
+        - name: write-icd
+          image: debian:stable-slim
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              mkdir -p /etc/OpenCL/vendors
+              echo "/opt/opencl/libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
+          volumeMounts:
+            - name: opencl-icd
+              mountPath: /etc/OpenCL/vendors
+            - name: opencl-libs
+              mountPath: /opt/opencl
+              readOnly: true
+
+      containers:
+        - name: minecraft-server
+          image: ghcr.io/YOURNAME/minecraft-fabric-gpu:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: mc
+              containerPort: 25565
+
+          envFrom:
+            - configMapRef:
+                name: mc-fabric-gpu-config
+          env:
+            - name: EULA
+              value: "TRUE"
+            - name: LD_LIBRARY_PATH
+              value: "/opt/opencl"
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: mods
+              mountPath: /data/mods
+            - name: config
+              mountPath: /data/config
+            - name: opencl-icd
+              mountPath: /etc/OpenCL/vendors
+            - name: opencl-libs
+              mountPath: /opt/opencl
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "2000m"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mc-fabric-gpu-data
+
+        - name: mods
+          emptyDir: {}
+
+        - name: config
+          emptyDir: {}
+
+        - name: host-opencl
+          hostPath:
+            path: /usr/lib64
+            type: Directory
+
+        - name: opencl-libs
+          emptyDir: {}
+
+        - name: opencl-icd
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fabric-gpu-c2me-minio
+  namespace: mc-server
+spec:
+  type: LoadBalancer
+  selector:
+    app: fabric-gpu-c2me-minio
+  ports:
+    - name: mc
+      port: 25565
+      targetPort: 25565

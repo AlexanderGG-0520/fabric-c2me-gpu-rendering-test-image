@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mc-server
+
+---
+# ================================================
+# PVC for persistent world data
+# ================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mc-fabric-gpu-data
+  namespace: mc-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 40Gi
+
+---
+# ================================================
+# ConfigMap: Minecraft Server Configuration
+# These map to entrypoint.sh ENV variables
+# ================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mc-fabric-gpu-config
+  namespace: mc-server
+data:
+  TYPE: "FABRIC"
+  VERSION: "1.21.10"
+  INIT_MEMORY: "1G"
+  MAX_MEMORY: "6G"
+  USE_AIKAR_FLAGS: "true"
+  MOTD: "Fabric GPU OpenCL Test Server"
+  DIFFICULTY: "normal"
+  MAX_PLAYERS: "20"
+  ENABLE_RCON: "false"
+  ENABLE_WHITELIST: "false"
+
+---
+# ================================================
+# Deployment: Minecraft Fabric GPU OpenCL Server
+# ================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fabric-c2me-gpu-test
+  namespace: mc-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: fabric-c2me-gpu-test
+  template:
+    metadata:
+      labels:
+        app: fabric-c2me-gpu-test
+    spec:
+      runtimeClassName: nvidia   # GPU runtime
+
+      containers:
+        - name: minecraft-server
+          image: ghcr.io/YOURNAME/minecraft-gpu-fabric:latest
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 25565
+              name: mc
+            - containerPort: 25575
+              name: rcon
+
+          envFrom:
+            - configMapRef:
+                name: mc-fabric-gpu-config
+
+          env:
+            - name: EULA
+              value: "TRUE"
+
+            # Required for Nvidia GPU
+            - name: LD_LIBRARY_PATH
+              value: "/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib64"
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+            # OpenCL ICD
+            - name: nvidia-icd
+              mountPath: /etc/OpenCL/vendors
+              readOnly: true
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "2000m"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mc-fabric-gpu-data
+
+        # HostPath for OpenCL ICD loader
+        - name: nvidia-icd
+          hostPath:
+            path: /etc/OpenCL/vendors
+            type: Directory
+
+---
+# ================================================
+# Service: Minecraft
+# ================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: fabric-c2me-gpu-test
+  namespace: mc-server
+spec:
+  type: LoadBalancer
+  selector:
+    app: fabric-c2me-gpu-test
+  ports:
+    - port: 25565
+      targetPort: 25565
+      name: mc
+    - port: 25575
+      targetPort: 25575
+      name: rcon
